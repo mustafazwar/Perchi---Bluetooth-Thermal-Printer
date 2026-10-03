@@ -108,15 +108,28 @@ class PrinterService extends ChangeNotifier {
   }
 
   /// Make sure we are connected, reconnecting to the saved printer if needed.
-  Future<bool> ensureConnected() async {
-    try {
-      if (await PrintBluetoothThermal.connectionStatus) {
-        connected = true;
-        notifyListeners();
-        return true;
-      }
-    } catch (_) {}
+  Future<bool> ensureConnected({bool forceReconnect = false}) async {
+    // The plugin can keep reporting an old/stale connection after
+    // writeBytes() fails. A forced reconnect must clear that connection.
+    if (!forceReconnect) {
+      try {
+        if (await PrintBluetoothThermal.connectionStatus) {
+          connected = true;
+          notifyListeners();
+          return true;
+        }
+      } catch (_) {}
+    }
+
     connected = false;
+    notifyListeners();
+
+    if (forceReconnect) {
+      try {
+        await PrintBluetoothThermal.disconnect;
+      } catch (_) {}
+    }
+
     final mac = settings.lastMac;
     if (mac.isEmpty) return false;
     if (!await _permission()) return false;
