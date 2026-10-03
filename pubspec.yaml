@@ -15,7 +15,7 @@ dependencies:
   path_provider: ^2.1.4
   file_picker: ^12.0.0
   pdfx: ^2.9.0
-  print_bluetooth_thermal: ^1.1.4
+  print_bluetooth_thermal: ^1.2.5
   permission_handler: ^11.3.1
   receive_sharing_intent: 1.8.1
   qr_flutter: ^4.1.0
