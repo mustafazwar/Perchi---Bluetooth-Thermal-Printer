@@ -53,7 +53,7 @@ class _PrintingScreenState extends State<PrintingScreen> with SingleTickerProvid
     );
   }
 
-  Future<void> _run() async {
+  Future<void> _run({bool forceReconnect = false}) async {
     final s = widget.session;
     final printer = context.read<PrinterService>();
     final hist = context.read<HistoryStore>();
@@ -69,7 +69,7 @@ class _PrintingScreenState extends State<PrintingScreen> with SingleTickerProvid
       if (s.bits == null) throw PrintFailure(s.error ?? 'Nothing to print');
       if (_cancel) return;
       setState(() => _phase = _Phase.connecting);
-      if (!await printer.ensureConnected()) {
+      if (!await printer.ensureConnected(forceReconnect: forceReconnect)) {
         final name = printer.settings.lastName;
         throw PrintFailure(printer.settings.lastMac.isEmpty
             ? 'No printer selected. Open the Printers tab and choose yours.'
@@ -194,7 +194,7 @@ class _PrintingScreenState extends State<PrintingScreen> with SingleTickerProvid
               Row(children: [
                 Expanded(child: PButton('Later', kind: BKind.ghost, onTap: () => Navigator.of(context).popUntil((r) => r.isFirst))),
                 const SizedBox(width: 12),
-                Expanded(child: PButton('Reconnect', icon: Icons.refresh, onTap: _run)),
+                Expanded(child: PButton('Reconnect', icon: Icons.refresh, onTap: () => _run(forceReconnect: true))),
               ]),
             ],
           ]),
