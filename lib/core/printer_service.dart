@@ -141,25 +141,74 @@ class PrinterService extends ChangeNotifier {
     void Function(double) onProgress, {
     bool Function()? cancelled,
   }) async {
-    const chunk = 900;
+    if (data.isEmpty) {
+      onProgress(1);
+      return;
+    }
+
+    // Keep Android writes small. Some thermal printers accept the Bluetooth
+    // connection but drop the socket when the first payload is too large.
+    const chunk = 256;
+    var reconnectUsed = false;
+
+    Future<void> hardDisconnect() async {
+      try {
+        final result = await PrintBluetoothThermal.disconnect;
+        debugPrint('Printer disconnect result: $result');
+      } catch (e) {
+        debugPrint('Printer disconnect error: $e');
+      }
+      connected = false;
+      notifyListeners();
+    }
+
+    Future<bool> writeChunk(List<int> bytes) async {
+      try {
+        return await PrintBluetoothThermal.writeBytes(bytes);
+      } catch (e) {
+        debugPrint('Printer write exception: $e');
+        return false;
+      }
+    }
+
+    // Give the native socket a moment to settle after connect().
+    await Future.delayed(const Duration(milliseconds: 250));
+
     for (var i = 0; i < data.length; i += chunk) {
       if (cancelled != null && cancelled()) throw PrintCancelled();
+
       final end = math.min(i + chunk, data.length);
-      final ok = await PrintBluetoothThermal.writeBytes(data.sublist(i, end));
+      final bytes = data.sublist(i, end);
+      var ok = await writeChunk(bytes);
+
       if (!ok) {
-        // writeBytes() failed. Close the native Bluetooth socket as well,
-        // so the next Reconnect starts from a clean connection.
-        try {
-          await PrintBluetoothThermal.disconnect;
-        } catch (_) {}
-        connected = false;
-        notifyListeners();
+        debugPrint('Printer write failed at $i/${data.length} bytes.');
+
+        // Do one automatic socket reset + reconnect + retry. This handles
+        // printers where connectionStatus is true but the native socket is
+        // already unusable.
+        if (!reconnectUsed && settings.lastMac.isNotEmpty) {
+          reconnectUsed = true;
+          await hardDisconnect();
+          await Future.delayed(const Duration(milliseconds: 350));
+
+          final reconnected = await ensureConnected(forceReconnect: true);
+          if (reconnected) {
+            await Future.delayed(const Duration(milliseconds: 350));
+            ok = await writeChunk(bytes);
+          }
+        }
+      }
+
+      if (!ok) {
+        await hardDisconnect();
         throw PrintFailure(
           'The printer dropped the connection while printing '
-          '(${i} bytes sent of ${data.length} bytes). '
+          '($i bytes sent of ${data.length} bytes). '
           'Tap Reconnect to try again.',
         );
       }
+
       onProgress(end / data.length);
       await Future.delayed(const Duration(milliseconds: 12));
     }
