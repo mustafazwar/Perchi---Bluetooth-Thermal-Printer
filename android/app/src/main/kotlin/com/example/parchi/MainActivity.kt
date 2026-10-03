@@ -5,13 +5,11 @@ import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothSocket
 import android.content.pm.PackageManager
-import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
-import java.io.IOException
 import java.io.OutputStream
 import java.util.UUID
 
@@ -23,6 +21,7 @@ class MainActivity : FlutterActivity() {
 
     private var socket: BluetoothSocket? = null
     private var output: OutputStream? = null
+    private val lock = Any()
     private val mainHandler = Handler(Looper.getMainLooper())
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
@@ -32,32 +31,44 @@ class MainActivity : FlutterActivity() {
             .setMethodCallHandler { call, result ->
                 when (call.method) {
                     "connect" -> {
-                        val mac = call.argument<String>("mac")
+                        val mac = (call.arguments as? Map<*, *>)?.get("mac") as? String
                         if (mac.isNullOrBlank()) {
                             result.error("INVALID_MAC", "Printer MAC address is empty.", null)
                             return@setMethodCallHandler
                         }
-
                         Thread {
-                            val ok = connectPrinter(mac)
-                            mainHandler.post { result.success(ok) }
+                            val err = connectPrinter(mac)
+                            mainHandler.post {
+                                if (err == null) result.success(true)
+                                else result.error("CONNECT_FAILED", err, null)
+                            }
                         }.start()
                     }
 
-                    "isConnected" -> {
-                        result.success(isSocketConnected())
-                    }
+                    "isConnected" -> result.success(isSocketConnected())
 
                     "writeBytes" -> {
-                        val bytes = call.argument<ByteArray>("bytes")
-                        if (bytes == null || bytes.isEmpty()) {
+                        // Accept both a bare byte array and {"bytes": byte array}.
+                        val args = call.arguments
+                        val bytes: ByteArray? = when (args) {
+                            is ByteArray -> args
+                            is Map<*, *> -> args["bytes"] as? ByteArray
+                            else -> null
+                        }
+                        if (bytes == null) {
+                            result.error("BAD_ARGS", "writeBytes needs a byte array.", null)
+                            return@setMethodCallHandler
+                        }
+                        if (bytes.isEmpty()) {
                             result.success(true)
                             return@setMethodCallHandler
                         }
-
                         Thread {
-                            val ok = writePrinter(bytes)
-                            mainHandler.post { result.success(ok) }
+                            val err = writePrinter(bytes)
+                            mainHandler.post {
+                                if (err == null) result.success(true)
+                                else result.error("WRITE_FAILED", err, null)
+                            }
                         }.start()
                     }
 
@@ -75,117 +86,86 @@ class MainActivity : FlutterActivity() {
 
     private fun hasBluetoothPermission(): Boolean {
         return android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.S ||
-            checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED
+                checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED
     }
 
+    /** Returns null on success, or a readable error message. */
     @Suppress("MissingPermission")
-    private fun connectPrinter(mac: String): Boolean {
-        if (!hasBluetoothPermission()) return false
+    private fun connectPrinter(mac: String): String? = synchronized(lock) {
+        if (!hasBluetoothPermission()) return "Bluetooth permission not granted."
+        closeQuietly()
 
-        disconnectPrinter()
+        val adapter = BluetoothAdapter.getDefaultAdapter() ?: return "No Bluetooth adapter."
+        if (!adapter.isEnabled) return "Bluetooth is off."
 
-        val adapter = BluetoothAdapter.getDefaultAdapter() ?: return false
-        if (!adapter.isEnabled) return false
-
-        return try {
-            adapter.cancelDiscovery()
-            val device: BluetoothDevice = adapter.getRemoteDevice(mac)
-
-            var newSocket: BluetoothSocket? = null
-            try {
-                newSocket = device.createRfcommSocketToServiceRecord(SPP_UUID)
-                newSocket.connect()
-            } catch (_: IOException) {
-                try {
-                    newSocket?.close()
-                } catch (_: IOException) {
-                }
-                newSocket = device.createInsecureRfcommSocketToServiceRecord(SPP_UUID)
-                newSocket.connect()
-            }
-
-            socket = newSocket
-            output = newSocket.getOutputStream()
-            true
-        } catch (_: Exception) {
-            try {
-                newSocketClose()
-            } catch (_: Exception) {
-            }
-            false
+        adapter.cancelDiscovery()
+        val device: BluetoothDevice = try {
+            adapter.getRemoteDevice(mac)
+        } catch (e: Exception) {
+            return "Bad printer address: ${e.message}"
         }
+
+        var lastErr = ""
+        // Try secure, then insecure. A fresh socket every attempt.
+        for (insecure in listOf(false, true)) {
+            var s: BluetoothSocket? = null
+            try {
+                s = if (insecure) device.createInsecureRfcommSocketToServiceRecord(SPP_UUID)
+                else device.createRfcommSocketToServiceRecord(SPP_UUID)
+                s.connect()
+                socket = s
+                output = s.outputStream
+                return null
+            } catch (e: Exception) {
+                lastErr = e.message ?: e.javaClass.simpleName
+                try { s?.close() } catch (_: Exception) {}
+            }
+        }
+        return "Could not open connection: $lastErr"
     }
 
-    private fun isSocketConnected(): Boolean {
-        return try {
+    private fun isSocketConnected(): Boolean = synchronized(lock) {
+        try {
             socket?.isConnected == true && output != null
         } catch (_: Exception) {
             false
         }
     }
 
-    private fun writePrinter(bytes: ByteArray): Boolean {
-        val out = output ?: return false
-        val currentSocket = socket ?: return false
+    /** Returns null on success, or a readable error message. */
+    private fun writePrinter(bytes: ByteArray): String? = synchronized(lock) {
+        val out = output ?: return "Not connected."
+        val s = socket ?: return "Not connected."
 
-        return try {
-            if (!currentSocket.isConnected) return false
+        try {
+            if (!s.isConnected) return "Socket is closed."
 
-            // Thermal printers are much more reliable when a raster ticket
-            // is sent in small blocks instead of one large Bluetooth write.
-            val chunkSize = 1024
+            // Small blocks + a short pause: cheap SPP printers have tiny buffers.
+            val chunkSize = 512
             var offset = 0
-
             while (offset < bytes.size) {
-                if (!currentSocket.isConnected) return false
-
                 val count = minOf(chunkSize, bytes.size - offset)
                 out.write(bytes, offset, count)
                 out.flush()
                 offset += count
-
-                // Give cheap SPP printers time to drain their small buffers.
-                if (offset < bytes.size) {
-                    Thread.sleep(12)
-                }
+                if (offset < bytes.size) Thread.sleep(20)
             }
-
-            true
-        } catch (_: Exception) {
-            disconnectPrinter()
-            false
+            return null
+        } catch (e: Exception) {
+            closeQuietly()
+            return "Write failed after link dropped: ${e.message ?: e.javaClass.simpleName}"
         }
     }
 
-    private fun disconnectPrinter(): Boolean {
-        var closedSomething = false
-
-        try {
-            output?.close()
-            closedSomething = true
-        } catch (_: Exception) {
-        }
-
-        try {
-            socket?.close()
-            closedSomething = true
-        } catch (_: Exception) {
-        }
-
-        output = null
-        socket = null
-        return closedSomething
+    private fun disconnectPrinter(): Boolean = synchronized(lock) {
+        val had = socket != null || output != null
+        closeQuietly()
+        had
     }
 
-    private fun newSocketClose() {
-        try {
-            output?.close()
-        } catch (_: Exception) {
-        }
-        try {
-            socket?.close()
-        } catch (_: Exception) {
-        }
+    private fun closeQuietly() {
+        try { output?.close() } catch (_: Exception) {}
+        try { socket?.close() } catch (_: Exception) {}
         output = null
         socket = null
     }

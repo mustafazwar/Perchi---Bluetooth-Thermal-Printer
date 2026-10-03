@@ -22,13 +22,14 @@ class PrinterService extends ChangeNotifier {
   final AppSettings settings;
 
   static const MethodChannel _nativePrinter =
-      MethodChannel('com.example.parchi/printer');
+  MethodChannel('com.example.parchi/printer');
 
   List<BluetoothInfo> paired = [];
   bool connected = false;
   bool busy = false;
   bool btOn = true;
   String? error;
+  String? lastNativeError;
 
   Future<bool> _permission() async {
     try {
@@ -96,10 +97,14 @@ class PrinterService extends ChangeNotifier {
       }
 
       ok = await _nativePrinter.invokeMethod<bool>(
-            'connect',
-            <String, dynamic>{'mac': mac},
-          ) ??
+        'connect',
+        <String, dynamic>{'mac': mac},
+      ) ??
           false;
+    } on PlatformException catch (e) {
+      debugPrint('Native printer connect error: ${e.code}: ${e.message}');
+      lastNativeError = e.message;
+      ok = false;
     } catch (e) {
       debugPrint('Native printer connect error: $e');
       ok = false;
@@ -113,7 +118,7 @@ class PrinterService extends ChangeNotifier {
       settings.lastMac = mac;
       settings.lastName = name;
     } else {
-      error = 'Could not connect to $name.';
+      error = 'Could not connect to $name.' + (lastNativeError == null ? '' : ' ($lastNativeError)');
     }
 
     notifyListeners();
@@ -157,22 +162,29 @@ class PrinterService extends ChangeNotifier {
 
   Future<bool> _nativeWrite(List<int> bytes) async {
     try {
+      lastNativeError = null;
+      // Kotlin reads call.argument<ByteArray>("bytes"), so this MUST be a map.
       return await _nativePrinter.invokeMethod<bool>(
-            'writeBytes',
-            Uint8List.fromList(bytes),
-          ) ??
+        'writeBytes',
+        <String, dynamic>{'bytes': Uint8List.fromList(bytes)},
+      ) ??
           false;
+    } on PlatformException catch (e) {
+      lastNativeError = '${e.code}: ${e.message}';
+      debugPrint('Native printer write error: $lastNativeError');
+      return false;
     } catch (e) {
+      lastNativeError = '$e';
       debugPrint('Native printer write error: $e');
       return false;
     }
   }
 
   Future<void> send(
-    Uint8List data,
-    void Function(double) onProgress, {
-    bool Function()? cancelled,
-  }) async {
+      Uint8List data,
+      void Function(double) onProgress, {
+        bool Function()? cancelled,
+      }) async {
     if (data.isEmpty) {
       onProgress(1);
       return;
@@ -198,7 +210,7 @@ class PrinterService extends ChangeNotifier {
         reconnectUsed = true;
         debugPrint(
           'Native printer write failed at ' + i.toString() +
-          '/' + data.length.toString() + '; reconnecting.',
+              '/' + data.length.toString() + '; reconnecting.',
         );
 
         await disconnect();
@@ -214,11 +226,7 @@ class PrinterService extends ChangeNotifier {
       if (!ok) {
         await disconnect();
         throw PrintFailure(
-          'The printer dropped the connection while printing (' +
-          i.toString() +
-          ' bytes sent of ' +
-          data.length.toString() +
-          ' bytes). Tap Reconnect to try again.',
+          'The printer dropped the connection while printing ($i bytes sent of ${data.length} bytes)${lastNativeError == null ? '' : ' [${lastNativeError!}]'}. Tap Reconnect to try again.',
         );
       }
 
