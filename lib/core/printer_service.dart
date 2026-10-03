@@ -2,6 +2,7 @@ import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:print_bluetooth_thermal/print_bluetooth_thermal.dart';
 
@@ -20,6 +21,9 @@ class PrinterService extends ChangeNotifier {
   PrinterService(this.settings);
   final AppSettings settings;
 
+  static const MethodChannel _nativePrinter =
+      MethodChannel('com.example.parchi/printer');
+
   List<BluetoothInfo> paired = [];
   bool connected = false;
   bool busy = false;
@@ -28,7 +32,10 @@ class PrinterService extends ChangeNotifier {
 
   Future<bool> _permission() async {
     try {
-      final r = await [Permission.bluetoothConnect, Permission.bluetoothScan].request();
+      final r = await [
+        Permission.bluetoothConnect,
+        Permission.bluetoothScan,
+      ].request();
       if (r[Permission.bluetoothConnect]?.isGranted ?? false) return true;
       return await PrintBluetoothThermal.isPermissionBluetoothGranted;
     } catch (_) {
@@ -36,7 +43,6 @@ class PrinterService extends ChangeNotifier {
     }
   }
 
-  /// Called once when the app opens.
   Future<void> startup() async {
     await refresh();
     if (settings.autoConnect && settings.lastMac.isNotEmpty && !connected && btOn) {
@@ -60,7 +66,7 @@ class PrinterService extends ChangeNotifier {
         } else {
           error = null;
           paired = await PrintBluetoothThermal.pairedBluetooths;
-          connected = await PrintBluetoothThermal.connectionStatus;
+          connected = await _nativeIsConnected();
         }
       }
     } catch (e) {
@@ -70,32 +76,56 @@ class PrinterService extends ChangeNotifier {
     notifyListeners();
   }
 
+  Future<bool> _nativeIsConnected() async {
+    try {
+      return await _nativePrinter.invokeMethod<bool>('isConnected') ?? false;
+    } catch (_) {
+      return false;
+    }
+  }
+
   Future<bool> connect(String mac, String name) async {
     busy = true;
     notifyListeners();
+
     var ok = false;
     try {
-      if (await PrintBluetoothThermal.connectionStatus) {
-        await PrintBluetoothThermal.disconnect;
+      if (!await _permission()) {
+        error = 'Allow Bluetooth permission to connect to your printer.';
+        return false;
       }
-      ok = await PrintBluetoothThermal.connect(macPrinterAddress: mac);
-    } catch (_) {
+
+      ok = await _nativePrinter.invokeMethod<bool>(
+            'connect',
+            <String, dynamic>{'mac': mac},
+          ) ??
+          false;
+    } catch (e) {
+      debugPrint('Native printer connect error: $e');
       ok = false;
+    } finally {
+      busy = false;
     }
+
     connected = ok;
     if (ok) {
+      error = null;
       settings.lastMac = mac;
       settings.lastName = name;
+    } else {
+      error = 'Could not connect to $name.';
     }
-    busy = false;
+
     notifyListeners();
     return ok;
   }
 
   Future<void> disconnect() async {
     try {
-      await PrintBluetoothThermal.disconnect;
-    } catch (_) {}
+      await _nativePrinter.invokeMethod<bool>('disconnect');
+    } catch (e) {
+      debugPrint('Native printer disconnect error: $e');
+    }
     connected = false;
     notifyListeners();
   }
@@ -107,33 +137,35 @@ class PrinterService extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// Make sure we are connected, reconnecting to the saved printer if needed.
   Future<bool> ensureConnected({bool forceReconnect = false}) async {
-    // The plugin can keep reporting an old/stale connection after
-    // writeBytes() fails. A forced reconnect must clear that connection.
-    if (!forceReconnect) {
-      try {
-        if (await PrintBluetoothThermal.connectionStatus) {
-          connected = true;
-          notifyListeners();
-          return true;
-        }
-      } catch (_) {}
-    }
-
-    connected = false;
-    notifyListeners();
+    if (!await _permission()) return false;
 
     if (forceReconnect) {
-      try {
-        await PrintBluetoothThermal.disconnect;
-      } catch (_) {}
+      await disconnect();
+      await Future.delayed(const Duration(milliseconds: 200));
+    } else if (await _nativeIsConnected()) {
+      connected = true;
+      notifyListeners();
+      return true;
     }
 
     final mac = settings.lastMac;
     if (mac.isEmpty) return false;
-    if (!await _permission()) return false;
+
     return connect(mac, settings.lastName);
+  }
+
+  Future<bool> _nativeWrite(List<int> bytes) async {
+    try {
+      return await _nativePrinter.invokeMethod<bool>(
+            'writeBytes',
+            Uint8List.fromList(bytes),
+          ) ??
+          false;
+    } catch (e) {
+      debugPrint('Native printer write error: $e');
+      return false;
+    }
   }
 
   Future<void> send(
@@ -146,71 +178,51 @@ class PrinterService extends ChangeNotifier {
       return;
     }
 
-    // Keep Android writes small. Some thermal printers accept the Bluetooth
-    // connection but drop the socket when the first payload is too large.
-    const chunk = 256;
+    const chunk = 1024;
     var reconnectUsed = false;
 
-    Future<void> hardDisconnect() async {
-      try {
-        final result = await PrintBluetoothThermal.disconnect;
-        debugPrint('Printer disconnect result: $result');
-      } catch (e) {
-        debugPrint('Printer disconnect error: $e');
-      }
-      connected = false;
-      notifyListeners();
+    Future<bool> writeRange(int start, int end) async {
+      return _nativeWrite(data.sublist(start, end));
     }
-
-    Future<bool> writeChunk(List<int> bytes) async {
-      try {
-        return await PrintBluetoothThermal.writeBytes(bytes);
-      } catch (e) {
-        debugPrint('Printer write exception: $e');
-        return false;
-      }
-    }
-
-    // Give the native socket a moment to settle after connect().
-    await Future.delayed(const Duration(milliseconds: 250));
 
     for (var i = 0; i < data.length; i += chunk) {
-      if (cancelled != null && cancelled()) throw PrintCancelled();
+      if (cancelled != null && cancelled()) {
+        await disconnect();
+        throw PrintCancelled();
+      }
 
       final end = math.min(i + chunk, data.length);
-      final bytes = data.sublist(i, end);
-      var ok = await writeChunk(bytes);
+      var ok = await writeRange(i, end);
 
-      if (!ok) {
-        debugPrint('Printer write failed at $i/${data.length} bytes.');
+      if (!ok && !reconnectUsed && settings.lastMac.isNotEmpty) {
+        reconnectUsed = true;
+        debugPrint(
+          'Native printer write failed at ' + i.toString() +
+          '/' + data.length.toString() + '; reconnecting.',
+        );
 
-        // Do one automatic socket reset + reconnect + retry. This handles
-        // printers where connectionStatus is true but the native socket is
-        // already unusable.
-        if (!reconnectUsed && settings.lastMac.isNotEmpty) {
-          reconnectUsed = true;
-          await hardDisconnect();
-          await Future.delayed(const Duration(milliseconds: 350));
+        await disconnect();
+        await Future.delayed(const Duration(milliseconds: 250));
 
-          final reconnected = await ensureConnected(forceReconnect: true);
-          if (reconnected) {
-            await Future.delayed(const Duration(milliseconds: 350));
-            ok = await writeChunk(bytes);
-          }
+        final reconnected = await ensureConnected(forceReconnect: false);
+        if (reconnected) {
+          await Future.delayed(const Duration(milliseconds: 250));
+          ok = await writeRange(i, end);
         }
       }
 
       if (!ok) {
-        await hardDisconnect();
+        await disconnect();
         throw PrintFailure(
-          'The printer dropped the connection while printing '
-          '($i bytes sent of ${data.length} bytes). '
-          'Tap Reconnect to try again.',
+          'The printer dropped the connection while printing (' +
+          i.toString() +
+          ' bytes sent of ' +
+          data.length.toString() +
+          ' bytes). Tap Reconnect to try again.',
         );
       }
 
       onProgress(end / data.length);
-      await Future.delayed(const Duration(milliseconds: 12));
     }
   }
 }
