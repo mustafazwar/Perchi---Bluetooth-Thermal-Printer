@@ -147,9 +147,18 @@ class PrinterService extends ChangeNotifier {
       final end = math.min(i + chunk, data.length);
       final ok = await PrintBluetoothThermal.writeBytes(data.sublist(i, end));
       if (!ok) {
+        // writeBytes() failed. Close the native Bluetooth socket as well,
+        // so the next Reconnect starts from a clean connection.
+        try {
+          await PrintBluetoothThermal.disconnect;
+        } catch (_) {}
         connected = false;
         notifyListeners();
-        throw PrintFailure('The printer stopped responding. Check it is on, has paper and is nearby.');
+        throw PrintFailure(
+          'The printer dropped the connection while printing '
+          '(${i} bytes sent of ${data.length} bytes). '
+          'Tap Reconnect to try again.',
+        );
       }
       onProgress(end / data.length);
       await Future.delayed(const Duration(milliseconds: 12));
