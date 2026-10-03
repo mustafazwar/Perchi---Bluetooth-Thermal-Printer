@@ -68,7 +68,7 @@ class SettingsScreen extends StatelessWidget {
           ),
         ]),
         const SizedBox(height: 20),
-        Center(child: Text('Parchi 1.0', style: TextStyle(color: p.mute, fontSize: 13))),
+        Center(child: Text('Parchi 1.1', style: TextStyle(color: p.mute, fontSize: 13))),
       ]),
     );
   }
