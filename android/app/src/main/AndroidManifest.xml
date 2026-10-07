@@ -8,7 +8,7 @@
 
 
     <application
-        android:label="parchi"
+        android:label="Parchi"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher">
         <activity

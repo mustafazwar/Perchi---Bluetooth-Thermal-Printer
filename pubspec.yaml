@@ -1,6 +1,7 @@
 name: parchi
 description: Parchi - free 58mm / 80mm Bluetooth thermal printing. Share a PDF or image, preview on paper, print with no watermark.
 publish_to: "none"
+
 version: 1.0.0+1
 
 environment:
@@ -25,6 +26,16 @@ dev_dependencies:
   flutter_test:
     sdk: flutter
   flutter_lints: ^4.0.0
+  flutter_launcher_icons: ^0.14.4
+
+flutter_launcher_icons:
+  image_path: "assets/images/logo.png"
+  android: true
+  ios: false     # Set to true if you also want to generate for iOS
+  image_path_android: "assets/images/logo.png" # Optional specific path for android
 
 flutter:
   uses-material-design: true
+
+  assets:
+    - assets/images/

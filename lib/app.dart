@@ -3,6 +3,7 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:parchi/ui/splash_screen.dart';
 import 'package:provider/provider.dart';
 import 'package:receive_sharing_intent/receive_sharing_intent.dart';
 
@@ -60,7 +61,8 @@ class _ParchiAppState extends State<ParchiApp> {
       themeMode: s.themeMode,
       theme: buildTheme(Brightness.light),
       darkTheme: buildTheme(Brightness.dark),
-      home: s.onboarded ? const HomeShell() : const OnboardingScreen(),
+      // home: s.onboarded ? const HomeShell() : const OnboardingScreen(),
+      home: s.onboarded ? const SplashScreen(nextScreen: HomeShell(),) : const OnboardingScreen(),
     );
   }
 }
